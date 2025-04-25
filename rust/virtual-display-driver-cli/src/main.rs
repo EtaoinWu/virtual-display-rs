@@ -1,12 +1,13 @@
+mod mode;
+
 use clap::Parser;
-use client::Client;
+use eyre::{bail, eyre, Context as _};
 use joinery::JoinableIterator;
 use lazy_format::lazy_format;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 
-mod client;
-mod mode;
+use driver_ipc::{sync::DriverClient, Id, Monitor};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -42,6 +43,8 @@ enum Command {
     Remove(RemoveCommand),
     /// Remove all virtual monitors.
     RemoveAll,
+    /// Persist changes to current user
+    Persist,
 }
 
 #[derive(Debug, Parser)]
@@ -106,7 +109,7 @@ struct RemoveCommand {
 
 fn main() -> eyre::Result<()> {
     let Args { options, command } = Args::parse();
-    let mut client = Client::connect()?;
+    let mut client = DriverClient::new().context("Failed to connect to Virtual Display Driver; please ensure the driver is installed and working")?;
 
     match command {
         Command::List => {
@@ -133,12 +136,20 @@ fn main() -> eyre::Result<()> {
         Command::RemoveAll => {
             remove_all(&mut client, &options)?;
         }
+        Command::Persist => {
+            persist(&mut client)?;
+        }
     }
 
     Ok(())
 }
 
-fn list(client: &mut Client, opts: &GlobalOptions) -> eyre::Result<()> {
+fn persist(client: &mut DriverClient) -> eyre::Result<()> {
+    client.persist()?;
+    Ok(())
+}
+
+fn list(client: &mut DriverClient, opts: &GlobalOptions) -> eyre::Result<()> {
     let monitors = client.monitors();
 
     if opts.json {
@@ -192,21 +203,26 @@ fn list(client: &mut Client, opts: &GlobalOptions) -> eyre::Result<()> {
     Ok(())
 }
 
-fn add(client: &mut Client, opts: &GlobalOptions, command: AddCommand) -> eyre::Result<()> {
+fn add(client: &mut DriverClient, opts: &GlobalOptions, command: AddCommand) -> eyre::Result<()> {
     let modes = command
         .mode
         .into_iter()
         .map(driver_ipc::Mode::from)
         .collect::<Vec<_>>();
 
-    let id = client.new_id(command.id)?;
+    let id = client
+        .new_id(command.id)
+        .ok_or_else(|| eyre!("Monitor {} already exists", command.id.unwrap()))?;
+
     let new_monitor = driver_ipc::Monitor {
         id,
         enabled: !command.disabled,
         name: command.name,
         modes,
     };
-    client.notify(vec![new_monitor])?;
+
+    client.add(new_monitor)?;
+    client.notify()?;
 
     if opts.json {
         let mut stdout = std::io::stdout().lock();
@@ -226,47 +242,59 @@ fn add(client: &mut Client, opts: &GlobalOptions, command: AddCommand) -> eyre::
 }
 
 fn add_mode(
-    client: &mut Client,
+    client: &mut DriverClient,
     opts: &GlobalOptions,
     command: AddModeCommand,
 ) -> eyre::Result<()> {
-    let mut monitor = client.find_monitor(&command.id)?;
+    let Some((id, new_modes)) = client.find_monitor_mut_query(&command.id, |monitor| {
+        let id = monitor.id;
 
-    let existing_modes = monitor.modes.iter().cloned().map(mode::Mode::from);
-    let new_modes = mode::merge(existing_modes.chain(command.mode));
-    let new_modes: Vec<driver_ipc::Mode> =
-        new_modes.into_iter().map(driver_ipc::Mode::from).collect();
+        let existing_modes = monitor.modes.iter().cloned().map(mode::Mode::from);
+        let new_modes = mode::merge(existing_modes.chain(command.mode));
+        let new_modes: Vec<driver_ipc::Mode> =
+            new_modes.into_iter().map(driver_ipc::Mode::from).collect();
 
-    monitor.modes = new_modes.clone();
-    client.notify(vec![monitor.clone()])?;
+        monitor.modes.clone_from(&new_modes);
+        (id, new_modes)
+    }) else {
+        bail!("Monitor `{}` not found", command.id);
+    };
+
+    client.notify()?;
 
     if opts.json {
         let mut stdout = std::io::stdout().lock();
         serde_json::to_writer_pretty(&mut stdout, &new_modes)?;
     } else {
-        println!(
-            "Added modes to virtual monitor with ID {}.",
-            monitor.id.green()
-        );
+        println!("Added modes to virtual monitor with ID {}.", id.green());
     }
 
     Ok(())
 }
 
 fn remove_mode(
-    client: &mut Client,
+    client: &mut DriverClient,
     opts: &GlobalOptions,
     command: &RemoveModeCommand,
 ) -> eyre::Result<()> {
-    let mut monitor = client.find_monitor(&command.id)?;
+    let (id, new_modes) = client
+        .find_monitor_mut_query(
+            &command.id,
+            |monitor: &mut Monitor| -> eyre::Result<(Id, Vec<driver_ipc::Mode>)> {
+                let id = monitor.id;
 
-    let modes = monitor.modes.iter().cloned().map(mode::Mode::from);
-    let new_modes = mode::remove(modes, &command.mode)?;
-    let new_modes: Vec<driver_ipc::Mode> =
-        new_modes.into_iter().map(driver_ipc::Mode::from).collect();
+                let modes = monitor.modes.iter().cloned().map(mode::Mode::from);
+                let new_modes = mode::remove(modes, &command.mode)?;
+                let new_modes: Vec<driver_ipc::Mode> =
+                    new_modes.into_iter().map(driver_ipc::Mode::from).collect();
 
-    monitor.modes = new_modes.clone();
-    client.notify(vec![monitor.clone()])?;
+                monitor.modes.clone_from(&new_modes);
+                eyre::Result::Ok((id, new_modes))
+            },
+        )
+        .ok_or(eyre!("Monitor `{}` not found", command.id))??;
+
+    client.notify()?;
 
     if opts.json {
         let mut stdout = std::io::stdout().lock();
@@ -275,14 +303,18 @@ fn remove_mode(
         println!(
             "Removed mode {} from virtual monitor with ID {}.",
             command.mode.blue(),
-            monitor.id.green()
+            id.green()
         );
     }
 
     Ok(())
 }
 
-fn enable(client: &mut Client, opts: &GlobalOptions, command: &EnableCommand) -> eyre::Result<()> {
+fn enable(
+    client: &mut DriverClient,
+    opts: &GlobalOptions,
+    command: &EnableCommand,
+) -> eyre::Result<()> {
     let outcome = set_enabled(client, &command.id, true)?;
 
     if opts.json {
@@ -304,7 +336,7 @@ fn enable(client: &mut Client, opts: &GlobalOptions, command: &EnableCommand) ->
 }
 
 fn disable(
-    client: &mut Client,
+    client: &mut DriverClient,
     opts: &GlobalOptions,
     command: &DisableCommand,
 ) -> eyre::Result<()> {
@@ -328,16 +360,13 @@ fn disable(
     Ok(())
 }
 
-fn remove(client: &mut Client, opts: &GlobalOptions, command: &RemoveCommand) -> eyre::Result<()> {
-    let monitor_ids = command
-        .id
-        .iter()
-        .map(|query| {
-            let monitor = client.find_monitor(query)?;
-            eyre::Ok(monitor.id)
-        })
-        .collect::<eyre::Result<Vec<_>>>()?;
-    client.remove(monitor_ids)?;
+fn remove(
+    client: &mut DriverClient,
+    opts: &GlobalOptions,
+    command: &RemoveCommand,
+) -> eyre::Result<()> {
+    client.remove_query(&command.id)?;
+    client.notify()?;
 
     if opts.json {
         let mut stdout = std::io::stdout().lock();
@@ -351,8 +380,9 @@ fn remove(client: &mut Client, opts: &GlobalOptions, command: &RemoveCommand) ->
     Ok(())
 }
 
-fn remove_all(client: &mut Client, opts: &GlobalOptions) -> eyre::Result<()> {
-    client.remove_all()?;
+fn remove_all(client: &mut DriverClient, opts: &GlobalOptions) -> eyre::Result<()> {
+    client.remove_all();
+    client.notify()?;
 
     if opts.json {
         let mut stdout = std::io::stdout().lock();
@@ -365,18 +395,19 @@ fn remove_all(client: &mut Client, opts: &GlobalOptions) -> eyre::Result<()> {
 }
 
 fn set_enabled(
-    client: &mut Client,
-    monitor_query: &str,
+    client: &mut DriverClient,
+    query: &str,
     enabled: bool,
 ) -> eyre::Result<EnableDisableOutcome> {
-    let mut monitor = client.find_monitor(monitor_query)?;
+    let monitor = client
+        .find_monitor_query(query)
+        .ok_or(eyre!("Monitor matching `{query}` not found"))?
+        .clone();
+
+    client.set_enabled_query(&[query], enabled)?;
+    client.notify()?;
 
     let should_toggle = enabled != monitor.enabled;
-
-    if should_toggle {
-        monitor.enabled = enabled;
-        client.notify(vec![monitor.clone()])?;
-    }
 
     Ok(EnableDisableOutcome {
         monitor,

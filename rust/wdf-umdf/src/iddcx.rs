@@ -1,14 +1,17 @@
 #![allow(non_snake_case)]
 #![allow(clippy::missing_errors_doc)]
 
+use std::sync::OnceLock;
+
 use wdf_umdf_sys::{
-    IDARG_IN_ADAPTER_INIT, IDARG_IN_MONITORCREATE, IDARG_IN_SWAPCHAINSETDEVICE,
-    IDARG_OUT_ADAPTER_INIT, IDARG_OUT_MONITORARRIVAL, IDARG_OUT_MONITORCREATE,
+    IDARG_IN_ADAPTER_INIT, IDARG_IN_MONITORCREATE, IDARG_IN_QUERY_HWCURSOR,
+    IDARG_IN_SETUP_HWCURSOR, IDARG_IN_SWAPCHAINSETDEVICE, IDARG_OUT_ADAPTER_INIT,
+    IDARG_OUT_MONITORARRIVAL, IDARG_OUT_MONITORCREATE, IDARG_OUT_QUERY_HWCURSOR,
     IDARG_OUT_RELEASEANDACQUIREBUFFER, IDDCX_ADAPTER, IDDCX_MONITOR, IDDCX_SWAPCHAIN,
     IDD_CX_CLIENT_CONFIG, NTSTATUS, WDFDEVICE, WDFDEVICE_INIT,
 };
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Copy, Clone, Debug, thiserror::Error)]
 pub enum IddCxError {
     #[error("{0}")]
     IddCxFunctionNotAvailable(&'static str),
@@ -48,7 +51,14 @@ macro_rules! IddCxCall {
     };
 
     ($other_is_error:expr, $name:ident ( $($args:expr),* )) => {{
-        let fn_handle = {
+        static CACHED_FN: OnceLock<
+            Result<
+                ::paste::paste!(::wdf_umdf_sys::[<PFN_ $name:upper>]),
+                IddCxError
+            >
+        > = OnceLock::new();
+
+        let f = CACHED_FN.get_or_init(|| {
             ::paste::paste! {
                 const FN_INDEX: usize = ::wdf_umdf_sys::IDDFUNCENUM::[<$name TableIndex>].0 as usize;
 
@@ -61,41 +71,36 @@ macro_rules! IddCxCall {
                     let fn_table = unsafe { ::wdf_umdf_sys::IddFunctions.as_ptr() };
 
                     // SAFETY: Ensured that this is present by if condition from `WdfIsFunctionAvailable!`
-                    let fn_handle = unsafe {
+                    let f = unsafe {
                         fn_table.add(FN_INDEX)
                             .cast::<::wdf_umdf_sys::[<PFN_ $name:upper>]>()
                     };
 
                     // SAFETY: Ensured that this is present by if condition from `IddIsFunctionAvailable!`
-                    let fn_handle = unsafe { fn_handle.read() };
-                    // SAFETY: All available function handles are not null
-                    let fn_handle = unsafe { fn_handle.unwrap_unchecked() };
+                    let f = unsafe { f.read() };
 
-                    Ok(fn_handle)
+                    Ok(f)
                 } else {
                     Err($crate::IddCxError::IddCxFunctionNotAvailable(concat!(stringify!($name), " is not available")))
                 }
             }
-        };
+        }).clone()?;
 
-        if let Ok(fn_handle) = fn_handle {
-            // SAFETY: Pointer to globals is always immutable
-            let globals = unsafe { ::wdf_umdf_sys::IddDriverGlobals };
+        // SAFETY: Above: If it's Ok, then it's guaranteed to be Some(fn)
+        let f = unsafe { f.unwrap_unchecked() };
 
-            // SAFETY: None. User is responsible for safety and must use their own unsafe block
-            let result = unsafe { fn_handle(globals, $($args),*) };
+        // SAFETY: Pointer to globals is always immutable
+        let globals = unsafe { ::wdf_umdf_sys::IddDriverGlobals };
 
-            if $crate::is_nt_error(&result, $other_is_error) {
-                Err(result.into())
-            } else {
-                Ok(result.into())
-            }
+        // SAFETY: None. User is responsible for safety and must use their own unsafe block
+        let result = unsafe { f(globals, $($args),*) };
+
+        if $crate::is_nt_error(&result, $other_is_error) {
+            Err(result.into())
         } else {
-            // SAFETY: We checked if it was Ok above, and it clearly isn't
-            Err(unsafe {
-                fn_handle.unwrap_err_unchecked()
-            })
+            Ok(result.into())
         }
+
     }};
 }
 
@@ -135,9 +140,9 @@ pub unsafe fn IddCxDeviceInitialize(
 /// None. User is responsible for safety.
 pub unsafe fn IddCxAdapterInitAsync(
     // in
-    pInArgs: *const IDARG_IN_ADAPTER_INIT,
+    pInArgs: &IDARG_IN_ADAPTER_INIT,
     // out
-    pOutArgs: *mut IDARG_OUT_ADAPTER_INIT,
+    pOutArgs: &mut IDARG_OUT_ADAPTER_INIT,
 ) -> Result<NTSTATUS, IddCxError> {
     IddCxCall! {
         IddCxAdapterInitAsync(
@@ -155,9 +160,9 @@ pub unsafe fn IddCxMonitorCreate(
     // in
     AdapterObject: IDDCX_ADAPTER,
     // in
-    pInArgs: *const IDARG_IN_MONITORCREATE,
+    pInArgs: &IDARG_IN_MONITORCREATE,
     // out
-    pOutArgs: *mut IDARG_OUT_MONITORCREATE,
+    pOutArgs: &mut IDARG_OUT_MONITORCREATE,
 ) -> Result<NTSTATUS, IddCxError> {
     IddCxCall!(
         IddCxMonitorCreate(
@@ -176,7 +181,7 @@ pub unsafe fn IddCxMonitorArrival(
     // in
     MonitorObject: IDDCX_MONITOR,
     // out
-    pOutArgs: *mut IDARG_OUT_MONITORARRIVAL,
+    pOutArgs: &mut IDARG_OUT_MONITORARRIVAL,
 ) -> Result<NTSTATUS, IddCxError> {
     IddCxCall!(
         IddCxMonitorArrival(
@@ -251,6 +256,45 @@ pub unsafe fn IddCxMonitorDeparture(
     IddCxCall!(
         IddCxMonitorDeparture(
             MonitorObject
+        )
+    )
+}
+
+/// # Safety
+///
+/// None. User is responsible for safety.
+#[rustfmt::skip]
+pub unsafe fn IddCxMonitorSetupHardwareCursor(
+    // in
+    MonitorObject: IDDCX_MONITOR,
+    // in
+    pInArgs: &IDARG_IN_SETUP_HWCURSOR
+) -> Result<NTSTATUS, IddCxError> {
+    IddCxCall!(
+        IddCxMonitorSetupHardwareCursor(
+            MonitorObject,
+            pInArgs
+        )
+    )
+}
+
+/// # Safety
+///
+/// None. User is responsible for safety.
+#[rustfmt::skip]
+pub unsafe fn IddCxMonitorQueryHardwareCursor(
+    // in
+    MonitorObject: IDDCX_MONITOR,
+    // in
+    pInArgs: &IDARG_IN_QUERY_HWCURSOR,
+    // out
+    pOutArgs: &mut IDARG_OUT_QUERY_HWCURSOR
+) -> Result<NTSTATUS, IddCxError> {
+    IddCxCall!(
+        IddCxMonitorQueryHardwareCursor(
+            MonitorObject,
+            pInArgs,
+            pOutArgs
         )
     )
 }
